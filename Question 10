@@ -1,0 +1,158 @@
+
+-- ---------- Shared helpers (run once) --------------------------------
+CREATE OR REPLACE PROCEDURE public.try_schedule(p_name text, p_cron text, p_cmd text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        EXECUTE format('SELECT cron.schedule(%L, %L, %L)', p_name, p_cron, p_cmd);
+        RAISE NOTICE 'Scheduled job % (%): %', p_name, p_cron, p_cmd;
+    ELSE
+        RAISE NOTICE 'pg_cron not installed. Would run: cron.schedule(%, %, %)', p_name, p_cron, p_cmd;
+    END IF;
+END $$;
+
+-- Pins search_path on every routine in a schema so that scheduled jobs
+-- and direct SQL from any session still find the right tables.
+CREATE OR REPLACE PROCEDURE public.pin_schema(p_schema text)
+LANGUAGE plpgsql AS $$
+DECLARE r record;
+BEGIN
+    FOR r IN SELECT p.oid::regprocedure AS sig
+             FROM pg_proc p WHERE p.pronamespace = p_schema::regnamespace
+    LOOP
+        EXECUTE format('ALTER ROUTINE %s SET search_path = %I, public', r.sig, p_schema);
+    END LOOP;
+END $$;
+
+
+=====================================================================
+-- QUESTION 10 : Scholarship Application Assessment
+-- =====================================================================
+DROP SCHEMA IF EXISTS q10 CASCADE;
+CREATE SCHEMA q10;
+SET search_path TO q10, public;
+
+-- (a)
+CREATE TABLE students (
+    student_id     INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    student_number VARCHAR(20) NOT NULL UNIQUE,
+    full_name      VARCHAR(100) NOT NULL
+);
+CREATE TABLE applications (
+    application_id     INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    student_id         INT NOT NULL REFERENCES students(student_id),
+    age_at_application INT NOT NULL CHECK (age_at_application > 0),
+    monthly_income     NUMERIC(12,2) NOT NULL CHECK (monthly_income >= 0),
+    average_mark       NUMERIC(5,2) NOT NULL CHECK (average_mark BETWEEN 0 AND 100),
+    submitted_on       DATE NOT NULL,
+    status             VARCHAR(10) NOT NULL DEFAULT 'PENDING',
+    CONSTRAINT ck_app_status CHECK (status IN ('PENDING','APPROVED','REJECTED'))
+);
+CREATE TABLE decision_audit (
+    audit_id       INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    application_id INT NOT NULL REFERENCES applications(application_id),
+    old_status     VARCHAR(10) NOT NULL,
+    new_status     VARCHAR(10) NOT NULL,
+    changed_at     TIMESTAMP NOT NULL DEFAULT now()
+);
+
+INSERT INTO students (student_number, full_name) VALUES
+ ('SC001','Applicant One'), ('SC002','Applicant Two'), ('SC003','Applicant Three');
+
+-- (b)
+CREATE OR REPLACE FUNCTION fn_scholarship_eligible(p_age INT, p_income NUMERIC, p_mark NUMERIC)
+RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_age IS NULL OR p_income IS NULL OR p_mark IS NULL THEN
+        RAISE EXCEPTION 'Age, income and mark must not be NULL';
+    END IF;
+    IF p_age <= 0 THEN RAISE EXCEPTION 'Age must be positive (got %)', p_age; END IF;
+    IF p_income < 0 THEN RAISE EXCEPTION 'Income must not be negative (got %)', p_income; END IF;
+    IF p_mark < 0 OR p_mark > 100 THEN RAISE EXCEPTION 'Mark must be 0-100 (got %)', p_mark; END IF;
+    RETURN p_age BETWEEN 18 AND 25 AND p_income <= 3000 AND p_mark >= 70;
+END $$;
+
+-- (c)
+CREATE OR REPLACE PROCEDURE pr_assess_application(p_application_id INT)
+LANGUAGE plpgsql AS $$
+DECLARE v_age INT; v_income NUMERIC; v_mark NUMERIC; v_status TEXT;
+BEGIN
+    SELECT age_at_application, monthly_income, average_mark, status
+    INTO v_age, v_income, v_mark, v_status
+    FROM applications WHERE application_id = p_application_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Application % does not exist', p_application_id;
+    END IF;
+    IF v_status <> 'PENDING' THEN
+        RAISE EXCEPTION 'Application % has already been assessed (%)', p_application_id, v_status;
+    END IF;
+    UPDATE applications
+    SET status = CASE WHEN fn_scholarship_eligible(v_age, v_income, v_mark)
+                      THEN 'APPROVED' ELSE 'REJECTED' END
+    WHERE application_id = p_application_id;
+END $$;
+
+-- (d)
+CREATE OR REPLACE FUNCTION tg_decision_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO decision_audit (application_id, old_status, new_status, changed_at)
+    VALUES (NEW.application_id, OLD.status, NEW.status, now());
+    RETURN NULL;
+END $$;
+
+CREATE TRIGGER trg_decision_audit
+AFTER UPDATE ON applications
+FOR EACH ROW
+WHEN (OLD.status IS DISTINCT FROM NEW.status)
+EXECUTE FUNCTION tg_decision_audit();
+
+-- (e) No income column exposed
+CREATE OR REPLACE VIEW v_approved_applicants AS
+SELECT s.student_number, s.full_name, a.average_mark, a.status
+FROM applications a JOIN students s ON s.student_id = a.student_id
+WHERE a.status = 'APPROVED';
+
+-- (g)
+CREATE OR REPLACE PROCEDURE pr_assess_pending()
+LANGUAGE plpgsql AS $$
+DECLARE r RECORD;
+BEGIN
+    FOR r IN SELECT application_id FROM applications
+             WHERE status = 'PENDING' ORDER BY application_id
+    LOOP
+        CALL pr_assess_application(r.application_id);
+    END LOOP;
+END $$;
+
+-- (f) Equality column (status) first, range column (submitted_on) second
+CREATE INDEX idx_app_status_submitted ON applications (status, submitted_on);
+
+CALL public.pin_schema('q10');
+
+-- Seed: six PENDING applications incl. boundaries
+INSERT INTO applications (student_id, age_at_application, monthly_income, average_mark, submitted_on) VALUES
+ (1, 20, 2500, 75.00, DATE '2026-11-01'),   -- qualifies
+ (1, 18, 3000, 70.00, DATE '2026-11-02'),   -- all lower/upper boundaries: qualifies
+ (2, 25, 1000, 90.00, DATE '2026-11-03'),   -- age 25 boundary: qualifies
+ (2, 26, 1000, 90.00, DATE '2026-11-04'),   -- too old
+ (3, 22, 3001, 80.00, DATE '2026-11-05'),   -- income just above limit
+ (3, 21, 2000, 69.99, DATE '2026-11-06');   -- mark just below limit
+
+-- Tests
+CALL pr_assess_pending();
+CALL pr_assess_pending();                     -- rerun: nothing pending, no duplicate audit rows
+SELECT application_id, status FROM applications ORDER BY 1;   -- 1,2,3 APPROVED; 4,5,6 REJECTED
+SELECT * FROM decision_audit;                 -- exactly 6 rows
+SELECT * FROM v_approved_applicants;
+-- CALL pr_assess_application(1);             -- fails: already assessed
+-- CALL pr_assess_application(999);           -- fails: unknown
+
+SET enable_seqscan = off;
+EXPLAIN SELECT * FROM applications
+WHERE status = 'PENDING' AND submitted_on BETWEEN DATE '2026-11-01' AND DATE '2026-11-30';
+RESET enable_seqscan;
+
+-- (g) every Monday 08:00
+CALL public.try_schedule('q10_assess_pending', '0 8 * * 1', 'CALL q10.pr_assess_pending()');
+
+-- 
